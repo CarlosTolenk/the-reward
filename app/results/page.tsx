@@ -33,6 +33,11 @@ export default async function ResultsPage({
   }
 
   const results = await prisma.drawResult.findMany({
+    include: {
+      winners: {
+        select: { id: true }
+      }
+    },
     where,
     orderBy: { date: "desc" }
   });
@@ -41,7 +46,9 @@ export default async function ResultsPage({
     id: draw.id,
     date: draw.date.toISOString().slice(0, 10),
     game: draw.game,
-    numbers: JSON.parse(draw.numbers ?? "[]")
+    hasWinner: draw.winners.length > 0,
+    numbers: JSON.parse(draw.numbers ?? "[]"),
+    winnerCount: draw.winners.length
   }));
 
   return (

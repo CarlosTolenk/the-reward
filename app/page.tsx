@@ -3,6 +3,11 @@ import { topNumbers } from "@/src/core/lottery/stats";
 
 export default async function DashboardPage() {
   const draws = await prisma.drawResult.findMany({
+    include: {
+      winners: {
+        select: { id: true }
+      }
+    },
     where: { game: "leidsa-loto" },
     orderBy: { date: "desc" }
   });
@@ -10,7 +15,9 @@ export default async function DashboardPage() {
   const mapped = draws.map((draw) => ({
     date: draw.date,
     game: draw.game,
-    numbers: JSON.parse(draw.numbers ?? "[]")
+    hasWinner: draw.winners.length > 0,
+    numbers: JSON.parse(draw.numbers ?? "[]"),
+    winnerCount: draw.winners.length
   }));
   const lastTen = mapped.slice(0, 10);
 
@@ -28,6 +35,7 @@ export default async function DashboardPage() {
           <table className="w-full text-left text-sm">
             <thead className="bg-black/5">
               <tr>
+                <th className="px-6 py-3">Prize</th>
                 <th className="px-6 py-3">Date</th>
                 <th className="px-6 py-3">Game</th>
                 <th className="px-6 py-3">Numbers</th>
@@ -36,6 +44,18 @@ export default async function DashboardPage() {
             <tbody>
               {lastTen.map((draw) => (
                 <tr key={`${draw.game}-${draw.date.toISOString()}`} className="border-t border-black/5">
+                  <td className="px-6 py-3">
+                    {draw.hasWinner ? (
+                      <span className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
+                        <svg aria-hidden="true" className="h-3.5 w-3.5 fill-current" viewBox="0 0 20 20">
+                          <path d="M10 1.5l2.47 5 5.53.8-4 3.9.94 5.5L10 14.1 5.06 16.7 6 11.2l-4-3.9 5.53-.8L10 1.5z" />
+                        </svg>
+                        {draw.winnerCount > 1 ? `${draw.winnerCount} winners` : "Winner"}
+                      </span>
+                    ) : (
+                      <span className="text-xs text-muted">No prize data</span>
+                    )}
+                  </td>
                   <td className="px-6 py-3">{draw.date.toISOString().slice(0, 10)}</td>
                   <td className="px-6 py-3">{draw.game}</td>
                   <td className="px-6 py-3">
