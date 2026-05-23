@@ -1,0 +1,83 @@
+import { prisma } from "@/src/lib/prisma";
+import { topNumbers } from "@/src/core/lottery/stats";
+
+export default async function DashboardPage() {
+  const draws = await prisma.drawResult.findMany({
+    where: { game: "leidsa-loto" },
+    orderBy: { date: "desc" }
+  });
+
+  const mapped = draws.map((draw) => ({
+    date: draw.date,
+    game: draw.game,
+    numbers: JSON.parse(draw.numbers ?? "[]")
+  }));
+  const lastTen = mapped.slice(0, 10);
+
+  const overallTop = topNumbers(mapped, 10);
+  const last30Top = topNumbers(mapped.slice(0, 30), 10);
+
+  return (
+    <div className="space-y-10">
+      <section className="rounded-2xl border border-black/10 bg-white shadow-sm">
+        <div className="px-6 py-5 border-b border-black/10">
+          <h2 className="text-xl font-semibold">Latest 10 Draws</h2>
+          <p className="text-sm text-muted">Recent results for quick reference.</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-black/5">
+              <tr>
+                <th className="px-6 py-3">Date</th>
+                <th className="px-6 py-3">Game</th>
+                <th className="px-6 py-3">Numbers</th>
+              </tr>
+            </thead>
+            <tbody>
+              {lastTen.map((draw) => (
+                <tr key={`${draw.game}-${draw.date.toISOString()}`} className="border-t border-black/5">
+                  <td className="px-6 py-3">{draw.date.toISOString().slice(0, 10)}</td>
+                  <td className="px-6 py-3">{draw.game}</td>
+                  <td className="px-6 py-3">
+                    {draw.numbers.join(" - ")}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="grid gap-6 md:grid-cols-2">
+        <div className="rounded-2xl border border-black/10 bg-white p-6 shadow-sm">
+          <h3 className="text-lg font-semibold">Most Frequent (Overall)</h3>
+          <p className="text-sm text-muted">Top 10 base numbers for Leidsa Loto.</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {overallTop.map((item) => (
+              <span
+                key={`overall-${item.number}`}
+                className="rounded-full border border-black/10 bg-black/5 px-3 py-1 text-sm"
+              >
+                {item.number} · {item.count}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-black/10 bg-white p-6 shadow-sm">
+          <h3 className="text-lg font-semibold">Most Frequent (Last 30)</h3>
+          <p className="text-sm text-muted">Recent momentum for Leidsa Loto base numbers.</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {last30Top.map((item) => (
+              <span
+                key={`last30-${item.number}`}
+                className="rounded-full border border-black/10 bg-black/5 px-3 py-1 text-sm"
+              >
+                {item.number} · {item.count}
+              </span>
+            ))}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}

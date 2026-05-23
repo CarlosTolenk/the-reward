@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Next.js / build output
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Local databases
+prisma/*.db
+prisma/*.db-journal
+prisma/*.db-shm
+prisma/*.db-wal
+
+# Python cache / virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Test / automation artifacts
+coverage/
+playwright-report/
+test-results/
+
+# Generated local outputs
+tmp/
+outputs/
+*.log
+
+# Local import / analysis artifacts
+leidsa-loto-history.json
+select.html
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/

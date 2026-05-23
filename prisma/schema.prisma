@@ -1,0 +1,26 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model DrawResult {
+  id        Int      @id @default(autoincrement())
+  date      DateTime
+  game      String
+  numbers   String
+  createdAt DateTime @default(now())
+
+  @@unique([game, date])
+}
+
+model SuggestionRun {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now())
+  constraints String
+  suggestions String
+  seed        String?
+}
