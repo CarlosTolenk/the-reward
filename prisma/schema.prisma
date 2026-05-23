@@ -13,6 +13,7 @@ model DrawResult {
   game      String
   numbers   String
   createdAt DateTime @default(now())
+  winners   WinnerRecord[]
 
   @@unique([game, date])
 }
@@ -23,4 +24,29 @@ model SuggestionRun {
   constraints String
   suggestions String
   seed        String?
+}
+
+model WinnerRecord {
+  id               Int         @id @default(autoincrement())
+  signature        String      @unique
+  game             String
+  category         String
+  drawDate         DateTime?
+  winnerName       String?
+  prizeAmountText  String?
+  prizeAmountValue Float?
+  currency         String?
+  location         String?
+  detailUrl        String?
+  sourcePage       Int?
+  sourceOrder      Int?
+  rawText          String
+  rawPayload       String
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  drawResultId     Int?
+  drawResult       DrawResult? @relation(fields: [drawResultId], references: [id], onDelete: SetNull)
+
+  @@index([game, category, drawDate])
+  @@index([drawResultId])
 }

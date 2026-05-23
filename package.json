@@ -10,7 +10,8 @@
     "test:watch": "vitest",
     "prisma:generate": "prisma generate",
     "backtest:lottery": "tsx scripts/backtest-lottery.ts",
-    "sync:leidsa:browser": "tsx scripts/sync-leidsa-browser.ts"
+    "sync:leidsa:browser": "tsx scripts/sync-leidsa-browser.ts",
+    "sync:leidsa:winners": "tsx scripts/sync-leidsa-winners-browser.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

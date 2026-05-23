@@ -221,15 +221,57 @@ V2_PROFILES: dict[str, V2Profile] = {
         bonus_weight=0.06,
         anchor_top_count=2,
     ),
+    "winner_context": V2Profile(
+        name="winner_context",
+        signal_weights={
+            "freq_5": 0.14,
+            "freq_10": 0.20,
+            "freq_20": 0.18,
+            "freq_40": 0.10,
+            "freq_60": 0.05,
+            "freq_90": 0.03,
+            "weekday_freq": 0.05,
+            "ewm_freq": 0.05,
+            "bucket_recent_share": 0.01,
+            "overdue_score": 0.01,
+            "jackpot_freq_20": 0.08,
+            "jackpot_freq_40": 0.05,
+            "solo_jackpot_freq_40": 0.03,
+            "shared_jackpot_freq_40": 0.02,
+            "prize_weighted_freq": 0.05,
+        },
+        quality_weights={
+            "mean": 0.42,
+            "min": 0.17,
+            "pair": 0.15,
+            "range": 0.07,
+            "bucket": 0.13,
+            "repeat_last": 0.04,
+        },
+        overlap_penalty=0.09,
+        concentration_penalty=0.03,
+        pair_penalty=0.015,
+        score_gap=0.14,
+        bonus_weight=0.08,
+        anchor_top_count=2,
+    ),
 }
 
 DEFAULT_V2_PROFILE = "base_focus_light"
+DEFAULT_WINNER_PROFILE = "winner_context"
 TARGET_V2_PROFILE_MAP = {
     "balanced": f"v2:{DEFAULT_V2_PROFILE}",
     "base": f"v2:{DEFAULT_V2_PROFILE}",
     "mas": "v2:current",
     "supermas": "v2:hybrid_anchor",
     "jackpot": "v2:hybrid_anchor",
+}
+TARGET_WINNER_PROFILE_MAP = {
+    "balanced": f"v2w:{DEFAULT_WINNER_PROFILE}",
+    "base": f"v2w:{DEFAULT_WINNER_PROFILE}",
+    "mas": f"v2w:{DEFAULT_WINNER_PROFILE}",
+    "supermas": f"v2w:{DEFAULT_WINNER_PROFILE}",
+    "jackpot": f"v2w:{DEFAULT_WINNER_PROFILE}",
 }
 
 
@@ -290,6 +332,8 @@ def resolve_target_config(target: str, include_mas: bool, include_super: bool) -
 def resolve_strategy_for_target(strategy: str, target: str) -> str:
     if strategy == "v2":
         return TARGET_V2_PROFILE_MAP.get(target, f"v2:{DEFAULT_V2_PROFILE}")
+    if strategy == "v2w":
+        return TARGET_WINNER_PROFILE_MAP.get(target, f"v2w:{DEFAULT_WINNER_PROFILE}")
     return strategy
 
 
@@ -310,6 +354,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-pool", type=int, default=18, help="Top numbers pool for weighted sampling.")
     parser.add_argument("--analyze-date", help="Specific draw date to inspect, YYYY-MM-DD.")
     parser.add_argument("--predict-date", help="Target date for live ticket generation, YYYY-MM-DD.")
+    parser.add_argument(
+        "--portfolio-strategy",
+        choices=["v2", "v2w"],
+        default="v2",
+        help="Strategy to use for live generation mode.",
+    )
     parser.add_argument("--constraints-json", help="JSON string with live constraints for generation mode.")
     parser.add_argument("--features-out", help="Optional CSV path for latest number feature table.")
     parser.add_argument("--backtest-out", help="Optional CSV path for per-draw backtest output.")
@@ -323,6 +373,18 @@ def load_draws(db_path: str, game: str) -> pd.DataFrame:
     try:
         query = "SELECT date, game, numbers FROM DrawResult WHERE game = ? ORDER BY date ASC"
         frame = pd.read_sql_query(query, conn, params=[game])
+        winner_query = """
+        SELECT
+          drawDate,
+          COUNT(*) AS winner_count,
+          SUM(COALESCE(prizeAmountValue, 0)) AS total_prize_amount,
+          MAX(prizeAmountValue) AS max_prize_amount
+        FROM WinnerRecord
+        WHERE game = ? AND drawDate IS NOT NULL
+        GROUP BY drawDate
+        ORDER BY drawDate ASC
+        """
+        winner_frame = pd.read_sql_query(winner_query, conn, params=[game])
     finally:
         conn.close()
 
@@ -330,6 +392,21 @@ def load_draws(db_path: str, game: str) -> pd.DataFrame:
         return frame
 
     frame["date"] = pd.to_datetime(frame["date"], unit="ms", utc=True).dt.tz_localize(None)
+
+    if not winner_frame.empty:
+        winner_frame["drawDate"] = pd.to_datetime(winner_frame["drawDate"], unit="ms", utc=True).dt.tz_localize(None)
+        winner_frame = winner_frame.rename(columns={"drawDate": "date"})
+        frame = frame.merge(winner_frame, on="date", how="left")
+    else:
+        frame["winner_count"] = 0.0
+        frame["total_prize_amount"] = 0.0
+        frame["max_prize_amount"] = 0.0
+
+    frame["winner_count"] = frame["winner_count"].fillna(0).astype(int)
+    frame["total_prize_amount"] = frame["total_prize_amount"].fillna(0.0).astype(float)
+    frame["max_prize_amount"] = frame["max_prize_amount"].fillna(0.0).astype(float)
+    frame["has_jackpot_winner"] = frame["winner_count"] > 0
+    frame["shared_jackpot"] = frame["winner_count"] > 1
 
     parsed = frame["numbers"].apply(json.loads)
     frame["base"] = parsed.apply(lambda values: values[:BASE_COUNT])
@@ -372,6 +449,56 @@ def compute_bucket_profile(training: pd.DataFrame) -> dict[int, float]:
 
     total_draws = max(len(recent_desc), 1)
     return {bucket: counts[bucket] / total_draws for bucket in range(BUCKET_COUNT)}
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def compute_regime_state(training: pd.DataFrame) -> dict[str, float]:
+    recent_desc = training.sort_values("date", ascending=False).reset_index(drop=True)
+    if recent_desc.empty:
+        return {
+            "rollover_pressure": 0.0,
+            "shared_pressure": 0.0,
+            "solo_pressure": 0.0,
+            "prize_pressure": 0.0,
+            "winner_rate_20": 0.0,
+            "shared_rate_20": 0.0,
+            "draws_since_last_winner": 0.0,
+            "draws_since_last_shared": 0.0,
+        }
+
+    has_winner = recent_desc["winner_count"] > 0
+    shared_winner = recent_desc["winner_count"] > 1
+    winner_indexes = np.flatnonzero(has_winner.to_numpy())
+    shared_indexes = np.flatnonzero(shared_winner.to_numpy())
+    draws_since_last_winner = int(winner_indexes[0]) if len(winner_indexes) > 0 else len(recent_desc)
+    draws_since_last_shared = int(shared_indexes[0]) if len(shared_indexes) > 0 else len(recent_desc)
+
+    winner_rate_10 = float(has_winner.head(10).mean()) if not recent_desc.empty else 0.0
+    winner_rate_20 = float(has_winner.head(20).mean()) if not recent_desc.empty else 0.0
+    shared_rate_20 = float(shared_winner.head(20).mean()) if not recent_desc.empty else 0.0
+    avg_prize_10 = float(recent_desc["max_prize_amount"].head(10).mean()) if not recent_desc.empty else 0.0
+    historical_positive = recent_desc.loc[recent_desc["max_prize_amount"] > 0, "max_prize_amount"]
+    baseline_prize = float(historical_positive.mean()) if not historical_positive.empty else 1.0
+    prize_pressure = clamp01((avg_prize_10 / max(baseline_prize, 1.0)) / 1.8)
+    no_winner_pressure = clamp01(draws_since_last_winner / 12.0)
+    no_shared_pressure = clamp01(draws_since_last_shared / 18.0)
+    rollover_pressure = clamp01((no_winner_pressure + (1.0 - winner_rate_20) + prize_pressure) / 3.0)
+    shared_pressure = clamp01((shared_rate_20 + (1.0 - no_shared_pressure)) / 2.0)
+    solo_pressure = clamp01((winner_rate_10 - shared_rate_20 + prize_pressure) / 2.0)
+
+    return {
+        "rollover_pressure": rollover_pressure,
+        "shared_pressure": shared_pressure,
+        "solo_pressure": solo_pressure,
+        "prize_pressure": prize_pressure,
+        "winner_rate_20": winner_rate_20,
+        "shared_rate_20": shared_rate_20,
+        "draws_since_last_winner": float(draws_since_last_winner),
+        "draws_since_last_shared": float(draws_since_last_shared),
+    }
 
 
 def compute_bucket_templates(training: pd.DataFrame) -> list[tuple[list[int], float]]:
@@ -422,21 +549,47 @@ def normalize_ticket_output(ticket: PortfolioTicket, constraints: dict[str, obje
 def get_v2_profile(strategy: str) -> V2Profile:
     if strategy == "v2":
         return V2_PROFILES[DEFAULT_V2_PROFILE]
+    if strategy == "v2w":
+        return V2_PROFILES[DEFAULT_WINNER_PROFILE]
     if strategy.startswith("v2:"):
+        profile_name = strategy.split(":", 1)[1]
+        return V2_PROFILES[profile_name]
+    if strategy.startswith("v2w:"):
         profile_name = strategy.split(":", 1)[1]
         return V2_PROFILES[profile_name]
     raise ValueError(f"Unsupported v2 strategy: {strategy}")
 
 
 def is_v2_strategy(strategy: str) -> bool:
-    return strategy == "v2" or strategy.startswith("v2:")
+    return strategy in {"v2", "v2w"} or strategy.startswith("v2:") or strategy.startswith("v2w:")
+
+
+def compute_recent_subset_frequency(slice_frame: pd.DataFrame, extractor) -> float:
+    if slice_frame.empty:
+        return 0.0
+    return float(slice_frame.apply(extractor, axis=1).mean())
+
+
+def compute_prize_weighted_frequency(slice_frame: pd.DataFrame, extractor) -> float:
+    if slice_frame.empty:
+        return 0.0
+
+    prize_weights = np.log1p(slice_frame["max_prize_amount"].clip(lower=0).to_numpy(dtype=float))
+    if np.allclose(prize_weights.sum(), 0.0):
+        prize_weights = np.ones(len(slice_frame), dtype=float)
+    hits = slice_frame.apply(extractor, axis=1).to_numpy(dtype=float)
+    return float((hits * prize_weights).sum() / prize_weights.sum())
 
 
 def compute_number_feature_table(training: pd.DataFrame, target_date: pd.Timestamp, strategy: str) -> pd.DataFrame:
     recent_desc = training.sort_values("date", ascending=False).reset_index(drop=True)
     target_weekday = target_date.weekday()
     bucket_profile = compute_bucket_profile(training)
+    regime_state = compute_regime_state(training)
     v2_profile = get_v2_profile(strategy) if is_v2_strategy(strategy) else None
+    recent_jackpots = recent_desc.loc[recent_desc["winner_count"] > 0].reset_index(drop=True)
+    recent_solo_jackpots = recent_desc.loc[recent_desc["winner_count"] == 1].reset_index(drop=True)
+    recent_shared_jackpots = recent_desc.loc[recent_desc["winner_count"] > 1].reset_index(drop=True)
     rows: list[dict[str, float | int]] = []
 
     for number in range(BASE_MIN, BASE_MAX + 1):
@@ -460,6 +613,21 @@ def compute_number_feature_table(training: pd.DataFrame, target_date: pd.Timesta
             "draws_since_seen": draws_since_seen,
             "bucket": number_bucket(number),
             "bucket_recent_share": bucket_profile[number_bucket(number)] / BASE_COUNT,
+            "jackpot_freq_20": compute_recent_subset_frequency(
+                recent_jackpots.head(20), lambda row: number in row["base"]
+            ),
+            "jackpot_freq_40": compute_recent_subset_frequency(
+                recent_jackpots.head(40), lambda row: number in row["base"]
+            ),
+            "solo_jackpot_freq_40": compute_recent_subset_frequency(
+                recent_solo_jackpots.head(40), lambda row: number in row["base"]
+            ),
+            "shared_jackpot_freq_40": compute_recent_subset_frequency(
+                recent_shared_jackpots.head(40), lambda row: number in row["base"]
+            ),
+            "prize_weighted_freq": compute_prize_weighted_frequency(
+                recent_jackpots.head(40), lambda row: number in row["base"]
+            ),
         }
 
         decay_weights = np.power(0.92, np.arange(len(recent_desc)))
@@ -472,6 +640,20 @@ def compute_number_feature_table(training: pd.DataFrame, target_date: pd.Timesta
     frame["overdue_score"] = normalize(frame["draws_since_seen"])
     if v2_profile is not None:
         frame["raw_signal"] = sum(frame[column] * weight for column, weight in v2_profile.signal_weights.items())
+        if strategy == "v2w" or strategy.startswith("v2w:"):
+            frame["regime_boost"] = (
+                frame["overdue_score"] * (0.10 * regime_state["rollover_pressure"])
+                + frame["jackpot_freq_20"] * (0.06 * regime_state["rollover_pressure"])
+                + frame["shared_jackpot_freq_40"] * (0.05 * regime_state["shared_pressure"])
+                + frame["solo_jackpot_freq_40"] * (0.04 * regime_state["solo_pressure"])
+                + frame["prize_weighted_freq"] * (0.06 * regime_state["prize_pressure"])
+            )
+            frame["raw_signal"] = frame["raw_signal"] + frame["regime_boost"]
+            frame["regime_rollover_pressure"] = regime_state["rollover_pressure"]
+            frame["regime_shared_pressure"] = regime_state["shared_pressure"]
+            frame["regime_solo_pressure"] = regime_state["solo_pressure"]
+        else:
+            frame["regime_boost"] = 0.0
         frame["marginal_probability"] = calibrate_probabilities(frame["raw_signal"], BASE_COUNT)
         frame["score"] = frame["marginal_probability"]
     else:
@@ -495,7 +677,11 @@ def compute_bonus_feature_table(
 ) -> pd.DataFrame:
     recent_desc = training.sort_values("date", ascending=False).reset_index(drop=True)
     target_weekday = target_date.weekday()
+    regime_state = compute_regime_state(training)
     v2_profile = get_v2_profile(strategy) if is_v2_strategy(strategy) else None
+    recent_jackpots = recent_desc.loc[recent_desc["winner_count"] > 0].reset_index(drop=True)
+    recent_solo_jackpots = recent_desc.loc[recent_desc["winner_count"] == 1].reset_index(drop=True)
+    recent_shared_jackpots = recent_desc.loc[recent_desc["winner_count"] > 1].reset_index(drop=True)
     rows: list[dict[str, float | int]] = []
 
     for number in range(1, max_value + 1):
@@ -511,6 +697,26 @@ def compute_bonus_feature_table(
                 "freq_40": float(seen_mask.head(40).mean()),
                 "weekday_freq": float((weekday_slice == number).mean()) if not weekday_slice.empty else 0,
                 "draws_since_seen": draws_since_seen,
+                "jackpot_freq_20": compute_recent_subset_frequency(
+                    recent_jackpots.head(20),
+                    lambda row: not pd.isna(row[column]) and int(row[column]) == number,
+                ),
+                "jackpot_freq_40": compute_recent_subset_frequency(
+                    recent_jackpots.head(40),
+                    lambda row: not pd.isna(row[column]) and int(row[column]) == number,
+                ),
+                "solo_jackpot_freq_40": compute_recent_subset_frequency(
+                    recent_solo_jackpots.head(40),
+                    lambda row: not pd.isna(row[column]) and int(row[column]) == number,
+                ),
+                "shared_jackpot_freq_40": compute_recent_subset_frequency(
+                    recent_shared_jackpots.head(40),
+                    lambda row: not pd.isna(row[column]) and int(row[column]) == number,
+                ),
+                "prize_weighted_freq": compute_prize_weighted_frequency(
+                    recent_jackpots.head(40),
+                    lambda row: not pd.isna(row[column]) and int(row[column]) == number,
+                ),
             }
         )
 
@@ -524,13 +730,22 @@ def compute_bonus_feature_table(
         + frame["overdue_score"] * 0.10
     )
     if v2_profile is not None:
-        frame["score"] = (
+        base_bonus_score = (
             frame["freq_10"] * 0.30
             + frame["freq_20"] * 0.28
             + frame["freq_40"] * 0.18
             + frame["weekday_freq"] * 0.12
             + frame["overdue_score"] * 0.12
         )
+        if strategy in {"v2w"} or strategy.startswith("v2w:"):
+            frame["score"] = (
+                base_bonus_score
+                + frame["jackpot_freq_20"] * (0.10 + 0.04 * regime_state["rollover_pressure"])
+                + frame["jackpot_freq_40"] * (0.08 + 0.03 * regime_state["shared_pressure"])
+                + frame["prize_weighted_freq"] * (0.06 + 0.04 * regime_state["prize_pressure"])
+            )
+        else:
+            frame["score"] = base_bonus_score
     frame["marginal_probability"] = calibrate_probabilities(frame["score"], 1.0)
     return frame.sort_values(["score", "freq_20", "number"], ascending=[False, False, True]).reset_index(drop=True)
 
@@ -581,6 +796,7 @@ def ticket_quality(
     last_draw_base: list[int],
     bucket_profile: dict[int, float],
     strategy: str,
+    regime_state: dict[str, float] | None = None,
 ) -> float:
     v2_profile = get_v2_profile(strategy) if is_v2_strategy(strategy) else None
     base_scores = [score_map[number] for number in base]
@@ -592,14 +808,16 @@ def ticket_quality(
         sum(abs(bucket_counts.get(bucket, 0) - bucket_profile.get(bucket, BASE_COUNT / BUCKET_COUNT)) for bucket in range(BUCKET_COUNT))
         / BASE_COUNT
     )
+    rollover_pressure = regime_state["rollover_pressure"] if regime_state is not None else 0.0
+    shared_pressure = regime_state["shared_pressure"] if regime_state is not None else 0.0
     if v2_profile is not None:
         return (
             np.mean(base_scores) * v2_profile.quality_weights["mean"]
             + np.min(base_scores) * v2_profile.quality_weights["min"]
             + pair_average * v2_profile.quality_weights["pair"]
-            + range_coverage * v2_profile.quality_weights["range"]
-            + bucket_fit * v2_profile.quality_weights["bucket"]
-            - repeat_last * v2_profile.quality_weights["repeat_last"]
+            + range_coverage * v2_profile.quality_weights["range"] * (1.0 + 0.35 * shared_pressure)
+            + bucket_fit * v2_profile.quality_weights["bucket"] * (1.0 + 0.25 * shared_pressure)
+            - repeat_last * v2_profile.quality_weights["repeat_last"] * (1.0 - 0.2 * rollover_pressure)
         )
     return (
         np.mean(base_scores) * 0.50
@@ -620,6 +838,7 @@ def generate_candidate_bases(
     top_pool: int,
     rng: np.random.Generator,
     strategy: str,
+    regime_state: dict[str, float] | None = None,
 ) -> list[tuple[list[int], float]]:
     score_map = dict(zip(feature_table["number"], feature_table["score"]))
     v2_profile = get_v2_profile(strategy) if is_v2_strategy(strategy) else None
@@ -664,7 +883,7 @@ def generate_candidate_bases(
             base.extend(weighted_sample_without_replacement(remainder_pool, remainder_weights, 2, rng))
         base = sorted(base)
         key = tuple(base)
-        score = ticket_quality(base, score_map, pair_scores, last_draw_base, bucket_profile, strategy)
+        score = ticket_quality(base, score_map, pair_scores, last_draw_base, bucket_profile, strategy, regime_state)
         candidates[key] = max(candidates.get(key, -1.0), score)
 
     return sorted(((list(key), score) for key, score in candidates.items()), key=lambda item: item[1], reverse=True)
@@ -680,6 +899,7 @@ def select_portfolio(
     target: str,
     include_mas: bool,
     include_super: bool,
+    regime_state: dict[str, float] | None = None,
 ) -> list[PortfolioTicket]:
     v2_profile = get_v2_profile(strategy) if is_v2_strategy(strategy) else None
     target_config = resolve_target_config(target, include_mas, include_super)
@@ -713,14 +933,19 @@ def select_portfolio(
         bonus_candidates.append((1, 1, 0.0))
 
     for base, score in candidate_bases:
+        rollover_pressure = regime_state["rollover_pressure"] if regime_state is not None else 0.0
+        shared_pressure = regime_state["shared_pressure"] if regime_state is not None else 0.0
+        dynamic_overlap_penalty = (v2_profile.overlap_penalty if v2_profile is not None else 0.08) * (1.0 - 0.2 * rollover_pressure)
+        dynamic_concentration_penalty = (v2_profile.concentration_penalty if v2_profile is not None else 0.03) * (1.0 - 0.15 * rollover_pressure)
+        dynamic_pair_penalty = (v2_profile.pair_penalty if v2_profile is not None else 0.0) * (1.0 + 0.25 * shared_pressure)
         overlap_penalty = sum(len(set(base) & set(ticket.base)) for ticket in selected) * (
-            v2_profile.overlap_penalty if v2_profile is not None else 0.08
+            dynamic_overlap_penalty
         )
         concentration_penalty = sum(repeated_numbers[number] for number in base) * (
-            v2_profile.concentration_penalty if v2_profile is not None else 0.03
+            dynamic_concentration_penalty
         )
         pair_penalty = sum(repeated_pairs[pair] for pair in combinations(base, 2)) * (
-            v2_profile.pair_penalty if v2_profile is not None else 0.0
+            dynamic_pair_penalty
         )
         adjusted = score - overlap_penalty - concentration_penalty
         adjusted -= pair_penalty
@@ -787,6 +1012,7 @@ def generate_portfolio(
     include_super: bool = True,
 ) -> tuple[list[PortfolioTicket], pd.DataFrame]:
     effective_strategy = resolve_strategy_for_target(strategy, target)
+    regime_state = compute_regime_state(training)
     feature_table = compute_number_feature_table(training, target_date, effective_strategy)
     mas_table = compute_bonus_feature_table(training, "mas", MAS_MAX, target_date, effective_strategy)
     super_table = compute_bonus_feature_table(training, "super_mas", SUPER_MAS_MAX, target_date, effective_strategy)
@@ -806,6 +1032,7 @@ def generate_portfolio(
         top_pool,
         rng,
         effective_strategy,
+        regime_state,
     )
     portfolio = select_portfolio(
         candidates,
@@ -817,6 +1044,7 @@ def generate_portfolio(
         target,
         include_mas,
         include_super,
+        regime_state,
     )
     return portfolio, feature_table
 
@@ -827,6 +1055,7 @@ def generate_live_tickets(
     constraints: dict[str, object],
     candidate_count: int,
     top_pool: int,
+    portfolio_strategy: str = "v2",
 ) -> dict[str, object]:
     target_date = pd.Timestamp(predict_date)
     seed = str(constraints.get("seed") or f"python-v2-{predict_date}")
@@ -846,7 +1075,7 @@ def generate_live_tickets(
             candidate_count=candidate_count,
             top_pool=top_pool,
             seed=seed_to_int(f"{seed}-{attempts}"),
-            strategy="v2",
+            strategy=portfolio_strategy,
             target=target,
             include_mas=include_mas,
             include_super=include_super,
@@ -870,7 +1099,7 @@ def generate_live_tickets(
             "generated_at": pd.Timestamp.utcnow().isoformat(),
             "seed": seed,
             "candidates_considered": attempts * candidate_count,
-            "strategy": "python-v2",
+            "strategy": "python-v2w" if portfolio_strategy == "v2w" else "python-v2",
             "batches_searched": attempts,
         },
     }
@@ -951,29 +1180,34 @@ def summarize_backtest(backtest: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def build_compare_frame(backtest_v1: pd.DataFrame, backtest_v2: pd.DataFrame) -> pd.DataFrame:
-    compare_frame = backtest_v1.copy()
+def build_compare_frame(
+    backtest_left: pd.DataFrame,
+    backtest_right: pd.DataFrame,
+    left_label: str = "v1",
+    right_label: str = "v2",
+) -> pd.DataFrame:
+    compare_frame = backtest_left.copy()
     compare_frame = compare_frame.rename(
         columns={
-            "average_base_hits": "v1_average_base_hits",
-            "max_base_hits": "v1_max_base_hits",
-            "any_mas_hit": "v1_any_mas_hit",
-            "any_super_mas_hit": "v1_any_super_mas_hit",
-            "any_bonus_pair_hit": "v1_any_bonus_pair_hit",
-            "unique_base_numbers": "v1_unique_base_numbers",
-            "portfolio_best_score": "v1_portfolio_best_score",
+            "average_base_hits": f"{left_label}_average_base_hits",
+            "max_base_hits": f"{left_label}_max_base_hits",
+            "any_mas_hit": f"{left_label}_any_mas_hit",
+            "any_super_mas_hit": f"{left_label}_any_super_mas_hit",
+            "any_bonus_pair_hit": f"{left_label}_any_bonus_pair_hit",
+            "unique_base_numbers": f"{left_label}_unique_base_numbers",
+            "portfolio_best_score": f"{left_label}_portfolio_best_score",
         }
     )
     compare_frame = compare_frame.merge(
-        backtest_v2.rename(
+        backtest_right.rename(
             columns={
-                "average_base_hits": "v2_average_base_hits",
-                "max_base_hits": "v2_max_base_hits",
-                "any_mas_hit": "v2_any_mas_hit",
-                "any_super_mas_hit": "v2_any_super_mas_hit",
-                "any_bonus_pair_hit": "v2_any_bonus_pair_hit",
-                "unique_base_numbers": "v2_unique_base_numbers",
-                "portfolio_best_score": "v2_portfolio_best_score",
+                "average_base_hits": f"{right_label}_average_base_hits",
+                "max_base_hits": f"{right_label}_max_base_hits",
+                "any_mas_hit": f"{right_label}_any_mas_hit",
+                "any_super_mas_hit": f"{right_label}_any_super_mas_hit",
+                "any_bonus_pair_hit": f"{right_label}_any_bonus_pair_hit",
+                "unique_base_numbers": f"{right_label}_unique_base_numbers",
+                "portfolio_best_score": f"{right_label}_portfolio_best_score",
             }
         ),
         on=["date", "actual_base", "actual_mas", "actual_super_mas"],
@@ -983,7 +1217,12 @@ def build_compare_frame(backtest_v1: pd.DataFrame, backtest_v2: pd.DataFrame) ->
     return compare_frame
 
 
-def summarize_windows(compare_frame: pd.DataFrame, windows: list[int] | None = None) -> dict[str, dict[str, object]]:
+def summarize_windows(
+    compare_frame: pd.DataFrame,
+    left_label: str = "v1",
+    right_label: str = "v2",
+    windows: list[int] | None = None,
+) -> dict[str, dict[str, object]]:
     if windows is None:
         windows = [15, 30, 60]
 
@@ -994,12 +1233,12 @@ def summarize_windows(compare_frame: pd.DataFrame, windows: list[int] | None = N
         slice_frame = sorted_frame.tail(window)
         if slice_frame.empty:
             continue
-        base_delta = float((slice_frame["v2_average_base_hits"] - slice_frame["v1_average_base_hits"]).mean())
-        max_delta = float((slice_frame["v2_max_base_hits"] - slice_frame["v1_max_base_hits"]).mean())
-        mas_delta = float((slice_frame["v2_any_mas_hit"] - slice_frame["v1_any_mas_hit"]).mean())
-        super_delta = float((slice_frame["v2_any_super_mas_hit"] - slice_frame["v1_any_super_mas_hit"]).mean())
-        bonus_pair_delta = float((slice_frame["v2_any_bonus_pair_hit"] - slice_frame["v1_any_bonus_pair_hit"]).mean())
-        diversity_delta = float((slice_frame["v2_unique_base_numbers"] - slice_frame["v1_unique_base_numbers"]).mean())
+        base_delta = float((slice_frame[f"{right_label}_average_base_hits"] - slice_frame[f"{left_label}_average_base_hits"]).mean())
+        max_delta = float((slice_frame[f"{right_label}_max_base_hits"] - slice_frame[f"{left_label}_max_base_hits"]).mean())
+        mas_delta = float((slice_frame[f"{right_label}_any_mas_hit"] - slice_frame[f"{left_label}_any_mas_hit"]).mean())
+        super_delta = float((slice_frame[f"{right_label}_any_super_mas_hit"] - slice_frame[f"{left_label}_any_super_mas_hit"]).mean())
+        bonus_pair_delta = float((slice_frame[f"{right_label}_any_bonus_pair_hit"] - slice_frame[f"{left_label}_any_bonus_pair_hit"]).mean())
+        diversity_delta = float((slice_frame[f"{right_label}_unique_base_numbers"] - slice_frame[f"{left_label}_unique_base_numbers"]).mean())
         summaries[f"last_{window}_draws"] = {
             "draw_count": int(len(slice_frame)),
             "date_range": {
@@ -1007,12 +1246,12 @@ def summarize_windows(compare_frame: pd.DataFrame, windows: list[int] | None = N
                 "to": slice_frame.iloc[-1]["date"].strftime("%Y-%m-%d"),
             },
             "winner": {
-                "average_base_hits": "v2" if base_delta > 0 else "v1",
-                "max_base_hits": "v2" if max_delta > 0 else "v1",
-                "mas_hit_rate": "v2" if mas_delta > 0 else "v1",
-                "super_mas_hit_rate": "v2" if super_delta > 0 else "v1",
-                "bonus_pair_hit_rate": "v2" if bonus_pair_delta > 0 else "v1",
-                "portfolio_diversity": "v2" if diversity_delta > 0 else "v1",
+                "average_base_hits": right_label if base_delta > 0 else left_label,
+                "max_base_hits": right_label if max_delta > 0 else left_label,
+                "mas_hit_rate": right_label if mas_delta > 0 else left_label,
+                "super_mas_hit_rate": right_label if super_delta > 0 else left_label,
+                "bonus_pair_hit_rate": right_label if bonus_pair_delta > 0 else left_label,
+                "portfolio_diversity": right_label if diversity_delta > 0 else left_label,
             },
             "v2_minus_v1": {
                 "average_base_hits": base_delta,
@@ -1027,7 +1266,7 @@ def summarize_windows(compare_frame: pd.DataFrame, windows: list[int] | None = N
     return summaries
 
 
-def summarize_by_month(compare_frame: pd.DataFrame) -> list[dict[str, object]]:
+def summarize_by_month(compare_frame: pd.DataFrame, left_label: str = "v1", right_label: str = "v2") -> list[dict[str, object]]:
     if compare_frame.empty:
         return []
 
@@ -1036,24 +1275,24 @@ def summarize_by_month(compare_frame: pd.DataFrame) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
 
     for month, group in month_frame.groupby("month", sort=True):
-        base_delta = float((group["v2_average_base_hits"] - group["v1_average_base_hits"]).mean())
-        max_delta = float((group["v2_max_base_hits"] - group["v1_max_base_hits"]).mean())
-        mas_delta = float((group["v2_any_mas_hit"] - group["v1_any_mas_hit"]).mean())
-        super_delta = float((group["v2_any_super_mas_hit"] - group["v1_any_super_mas_hit"]).mean())
-        bonus_pair_delta = float((group["v2_any_bonus_pair_hit"] - group["v1_any_bonus_pair_hit"]).mean())
-        diversity_delta = float((group["v2_unique_base_numbers"] - group["v1_unique_base_numbers"]).mean())
+        base_delta = float((group[f"{right_label}_average_base_hits"] - group[f"{left_label}_average_base_hits"]).mean())
+        max_delta = float((group[f"{right_label}_max_base_hits"] - group[f"{left_label}_max_base_hits"]).mean())
+        mas_delta = float((group[f"{right_label}_any_mas_hit"] - group[f"{left_label}_any_mas_hit"]).mean())
+        super_delta = float((group[f"{right_label}_any_super_mas_hit"] - group[f"{left_label}_any_super_mas_hit"]).mean())
+        bonus_pair_delta = float((group[f"{right_label}_any_bonus_pair_hit"] - group[f"{left_label}_any_bonus_pair_hit"]).mean())
+        diversity_delta = float((group[f"{right_label}_unique_base_numbers"] - group[f"{left_label}_unique_base_numbers"]).mean())
 
         rows.append(
             {
                 "month": month,
                 "draw_count": int(len(group)),
                 "winner": {
-                    "average_base_hits": "v2" if base_delta > 0 else "v1",
-                    "max_base_hits": "v2" if max_delta > 0 else "v1",
-                    "mas_hit_rate": "v2" if mas_delta > 0 else "v1",
-                    "super_mas_hit_rate": "v2" if super_delta > 0 else "v1",
-                    "bonus_pair_hit_rate": "v2" if bonus_pair_delta > 0 else "v1",
-                    "portfolio_diversity": "v2" if diversity_delta > 0 else "v1",
+                    "average_base_hits": right_label if base_delta > 0 else left_label,
+                    "max_base_hits": right_label if max_delta > 0 else left_label,
+                    "mas_hit_rate": right_label if mas_delta > 0 else left_label,
+                    "super_mas_hit_rate": right_label if super_delta > 0 else left_label,
+                    "bonus_pair_hit_rate": right_label if bonus_pair_delta > 0 else left_label,
+                    "portfolio_diversity": right_label if diversity_delta > 0 else left_label,
                 },
                 "v2_minus_v1": {
                     "average_base_hits": base_delta,
@@ -1243,6 +1482,7 @@ def main() -> None:
             constraints=constraints,
             candidate_count=args.candidate_count,
             top_pool=args.top_pool,
+            portfolio_strategy=args.portfolio_strategy,
         )
         output = json.dumps(to_builtin(generated), indent=2)
         if args.json_out:
@@ -1262,7 +1502,7 @@ def main() -> None:
         )
         print(json.dumps(to_builtin(tuning_result), indent=2))
         return
-    strategies = ["v1", "v2"]
+    strategies = ["v1", "v2", "v2w"]
     backtests: dict[str, pd.DataFrame] = {}
     latest_features_by_strategy: dict[str, pd.DataFrame] = {}
     latest_portfolio_by_strategy: dict[str, list[PortfolioTicket]] = {}
@@ -1291,26 +1531,46 @@ def main() -> None:
         latest_features_by_strategy[strategy] = latest_features
 
     backtest_summaries = {strategy: summarize_backtest(backtests[strategy]) for strategy in strategies}
-    compare_frame = build_compare_frame(backtests["v1"], backtests["v2"])
-    comparison = {
-        "v2_minus_v1": {
-            key: backtest_summaries["v2"][key] - backtest_summaries["v1"][key]
-            for key in backtest_summaries["v1"].keys()
-            if key != "draws_evaluated"
-        },
-        "winner_by_metric": {
-            key: ("v2" if backtest_summaries["v2"][key] > backtest_summaries["v1"][key] else "v1")
-            for key in backtest_summaries["v1"].keys()
-            if key != "draws_evaluated"
-        },
-        "recent_windows": summarize_windows(compare_frame),
-        "monthly_breakdown": summarize_by_month(compare_frame),
+    compare_frames = {
+        "v2_vs_v1": build_compare_frame(backtests["v1"], backtests["v2"], "v1", "v2"),
+        "v2w_vs_v1": build_compare_frame(backtests["v1"], backtests["v2w"], "v1", "v2w"),
+        "v2w_vs_v2": build_compare_frame(backtests["v2"], backtests["v2w"], "v2", "v2w"),
     }
+    comparison: dict[str, object] = {}
+    for label, (left_strategy, right_strategy) in {
+        "v2_vs_v1": ("v1", "v2"),
+        "v2w_vs_v1": ("v1", "v2w"),
+        "v2w_vs_v2": ("v2", "v2w"),
+    }.items():
+        left_summary = backtest_summaries[left_strategy]
+        right_summary = backtest_summaries[right_strategy]
+        compare_frame = compare_frames[label]
+        comparison[label] = {
+            "delta": {
+                key: right_summary[key] - left_summary[key]
+                for key in left_summary.keys()
+                if key != "draws_evaluated"
+            },
+            "winner_by_metric": {
+                key: (right_strategy if right_summary[key] > left_summary[key] else left_strategy)
+                for key in left_summary.keys()
+                if key != "draws_evaluated"
+            },
+            "recent_windows": summarize_windows(compare_frame, left_strategy, right_strategy),
+            "monthly_breakdown": summarize_by_month(compare_frame, left_strategy, right_strategy),
+        }
 
     summary = {
         "game": args.game,
         "target": args.target,
         "draw_count": int(len(draws)),
+        "winner_context": {
+            "draws_with_jackpot_winner": int(draws["has_jackpot_winner"].sum()),
+            "shared_jackpot_draws": int(draws["shared_jackpot"].sum()),
+            "average_winner_count_when_won": float(draws.loc[draws["winner_count"] > 0, "winner_count"].mean())
+            if (draws["winner_count"] > 0).any()
+            else 0.0,
+        },
         "date_range": {
             "from": draws.iloc[0]["date"].strftime("%Y-%m-%d"),
             "to": draws.iloc[-1]["date"].strftime("%Y-%m-%d"),
@@ -1338,11 +1598,11 @@ def main() -> None:
 
     if args.features_out:
         Path(args.features_out).parent.mkdir(parents=True, exist_ok=True)
-        latest_features_by_strategy["v2"].to_csv(args.features_out, index=False)
+        latest_features_by_strategy["v2w"].to_csv(args.features_out, index=False)
 
     if args.backtest_out:
         Path(args.backtest_out).parent.mkdir(parents=True, exist_ok=True)
-        compare_frame.to_csv(args.backtest_out, index=False)
+        compare_frames["v2w_vs_v1"].to_csv(args.backtest_out, index=False)
 
     if args.analyze_date:
         summary["analyze_date"] = {

@@ -45,6 +45,7 @@ export async function POST(request: Request) {
   let resolvedStrategy: SuggestionResult["metadata"]["strategy"] | null = null;
   const wantsLegacy = strategy === "legacy";
   const wantsImproved = strategy === "improved";
+  const wantsPythonWinnerContext = strategy === "python-v2w";
   const shouldTryPython = !wantsLegacy && !wantsImproved && canUsePythonV2(constraints);
 
   for (let batch = 0; batch < maxBatches; batch += 1) {
@@ -61,7 +62,10 @@ export async function POST(request: Request) {
       batchSuggestions = generateSuggestions(seededConstraints, recentDraws);
     } else if (shouldTryPython) {
       try {
-        batchSuggestions = await generatePythonSuggestions(seededConstraints);
+        batchSuggestions = await generatePythonSuggestions(
+          seededConstraints,
+          wantsPythonWinnerContext ? "python-v2w" : "python-v2"
+        );
         if (batchSuggestions.tickets.length === 0) {
           batchSuggestions = generateSuggestions(seededConstraints, recentDraws);
         }
@@ -105,7 +109,9 @@ export async function POST(request: Request) {
     candidatesConsidered,
     generatedAt: new Date().toISOString(),
     seed: baseSeed,
-    strategy: resolvedStrategy ?? (wantsLegacy ? "legacy" : shouldTryPython ? "python-v2" : "improved")
+    strategy:
+      resolvedStrategy ??
+      (wantsLegacy ? "legacy" : shouldTryPython ? (wantsPythonWinnerContext ? "python-v2w" : "python-v2") : "improved")
   };
 
   await prisma.suggestionRun.create({

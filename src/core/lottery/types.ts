@@ -23,7 +23,7 @@ export type SuggestionMetadata = {
   generatedAt: string;
   seed: string | null;
   candidatesConsidered: number;
-  strategy: "legacy" | "improved" | "python-v2";
+  strategy: "legacy" | "improved" | "python-v2" | "python-v2w";
 };
 
 export type SuggestionResult = {

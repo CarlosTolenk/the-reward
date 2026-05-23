@@ -57,6 +57,26 @@ export const resultsQuerySchema = z.object({
   to: z.string().optional()
 });
 
+export const winnersQuerySchema = z.object({
+  category: z.string().optional(),
+  from: z.string().optional(),
+  game: z.string().optional(),
+  includeDraw: z.enum(["true", "false"]).optional(),
+  limit: z.string().optional(),
+  linkedOnly: z.enum(["true", "false"]).optional(),
+  page: z.string().optional(),
+  to: z.string().optional()
+});
+
+export const drawInsightsQuerySchema = z.object({
+  from: z.string().optional(),
+  game: z.string().optional(),
+  limit: z.string().optional(),
+  page: z.string().optional(),
+  to: z.string().optional(),
+  winnersOnly: z.enum(["true", "false"]).optional()
+});
+
 export const importLeidsaSchema = z.object({
   gameKey: z.string().min(1).optional(),
   gameKeys: z.array(z.string().min(1)).optional(),

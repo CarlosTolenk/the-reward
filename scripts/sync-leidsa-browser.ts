@@ -19,6 +19,8 @@ type SyncOptions = {
   headless: boolean;
   jsonOut?: string;
   limit?: number;
+  manualVerify: boolean;
+  manualVerifyTimeoutMs: number;
   startUrl: string;
   timeoutMs: number;
   userDataDir: string;
@@ -50,6 +52,11 @@ function parseArgs(argv: string[]): SyncOptions {
     headless: options.headless === true || options.headless === "true",
     jsonOut: typeof options["json-out"] === "string" ? options["json-out"] : undefined,
     limit: typeof options.limit === "string" ? Number(options.limit) : undefined,
+    manualVerify: options["manual-verify"] !== "false",
+    manualVerifyTimeoutMs:
+      typeof options["manual-verify-timeout-ms"] === "string"
+        ? Number(options["manual-verify-timeout-ms"])
+        : 5 * 60 * 1000,
     startUrl: typeof options.url === "string" ? options.url : getDefaultLeidsaResultsUrl(),
     timeoutMs: typeof options["timeout-ms"] === "string" ? Number(options["timeout-ms"]) : 45000,
     userDataDir:
@@ -57,6 +64,36 @@ function parseArgs(argv: string[]): SyncOptions {
         ? options["user-data-dir"]
         : path.join(process.cwd(), ".cache", "leidsa-browser-profile")
   };
+}
+
+async function isSecurityVerificationPage(page: Page) {
+  return page.evaluate(() => {
+    const bodyText = document.body?.innerText ?? "";
+    return [
+      "Just a moment",
+      "Enable JavaScript and cookies to continue",
+      "Performing security verification",
+      "verifies you are not a bot"
+    ].some((snippet) => bodyText.includes(snippet));
+  });
+}
+
+async function waitForManualVerification(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  console.log(
+    `Cloudflare verification detected. Complete the challenge in the opened browser window within ${Math.round(
+      timeoutMs / 1000
+    )} seconds.`
+  );
+
+  while (Date.now() < deadline) {
+    if (!(await isSecurityVerificationPage(page))) {
+      return true;
+    }
+    await page.waitForTimeout(2000);
+  }
+
+  return false;
 }
 
 async function waitForResultsPage(page: Page, timeoutMs: number) {
@@ -151,13 +188,32 @@ async function main() {
   }
 
   const context = await chromium.launchPersistentContext(options.userDataDir, {
+    args: ["--disable-blink-features=AutomationControlled"],
     executablePath: browserPath,
-    headless: options.headless
+    headless: options.headless,
+    locale: "en-US",
+    timezoneId: "America/Santo_Domingo",
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 900 }
   });
 
   try {
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "es-DO", "es"] });
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    });
+
     const page = context.pages()[0] ?? (await context.newPage());
     await page.goto(options.startUrl, { waitUntil: "domcontentloaded", timeout: options.timeoutMs });
+
+    if (!options.headless && options.manualVerify && (await isSecurityVerificationPage(page))) {
+      const cleared = await waitForManualVerification(page, options.manualVerifyTimeoutMs);
+      if (!cleared) {
+        throw new Error("Cloudflare verification was not completed before the timeout.");
+      }
+    }
 
     try {
       await waitForResultsPage(page, options.timeoutMs);

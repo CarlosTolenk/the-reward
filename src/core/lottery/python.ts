@@ -53,7 +53,10 @@ export function canUsePythonV2(constraints: Constraints): boolean {
   return true;
 }
 
-export async function generatePythonSuggestions(constraints: Constraints): Promise<SuggestionResult> {
+export async function generatePythonSuggestions(
+  constraints: Constraints,
+  strategy: "python-v2" | "python-v2w" = "python-v2"
+): Promise<SuggestionResult> {
   const python = resolvePythonBinary();
   const scriptPath = path.join(process.cwd(), "scripts", "loto_python_analysis.py");
   const dbPath = path.join(process.cwd(), "prisma", "dev.db");
@@ -71,6 +74,8 @@ export async function generatePythonSuggestions(constraints: Constraints): Promi
       constraints.game,
       "--target",
       constraints.target,
+      "--portfolio-strategy",
+      strategy === "python-v2w" ? "v2w" : "v2",
       "--ticket-count",
       String(constraints.count),
       "--candidate-count",
@@ -103,7 +108,7 @@ export async function generatePythonSuggestions(constraints: Constraints): Promi
       generatedAt: parsed.metadata?.generated_at ?? new Date().toISOString(),
       seed: parsed.metadata?.seed ?? constraints.seed ?? null,
       candidatesConsidered: parsed.metadata?.candidates_considered ?? candidateCount,
-      strategy: "python-v2"
+      strategy: strategy
     }
   };
 }
