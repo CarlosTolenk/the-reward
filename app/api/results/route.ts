@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/src/lib/prisma";
 import { deleteResultSchema, drawSchema, resultsQuerySchema } from "@/src/core/lottery/schema";
+import { splitDrawNumbers } from "@/src/core/lottery/analysis";
 
 function parseDate(value?: string | null): Date | null {
   if (!value) {
@@ -80,9 +81,10 @@ export async function POST(request: Request) {
   }
 
   const numbers = parsed.data.numbers;
-  const unique = new Set(numbers);
-  if (unique.size !== numbers.length) {
-    return NextResponse.json({ error: "Numbers must be unique" }, { status: 400 });
+  const { base } = splitDrawNumbers(numbers);
+  const uniqueBase = new Set(base);
+  if (uniqueBase.size !== base.length) {
+    return NextResponse.json({ error: "Base numbers must be unique" }, { status: 400 });
   }
 
   try {
